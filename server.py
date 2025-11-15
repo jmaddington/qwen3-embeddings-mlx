@@ -11,6 +11,7 @@ import sys
 import time
 import asyncio
 import logging
+import gc
 from typing import List, Optional, Dict, Any, Tuple
 from functools import lru_cache
 from contextlib import asynccontextmanager
@@ -28,7 +29,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 import uvicorn
 
 # Constants
-DEFAULT_MODEL = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+DEFAULT_MODEL = "mlx-community/Qwen3-Embedding-8B-4bit-DWQ"
 
 # Available models configuration
 AVAILABLE_MODELS = {
@@ -55,10 +56,11 @@ for model_name, config in AVAILABLE_MODELS.items():
     for alias in config.get("alias", []):
         MODEL_ALIASES[alias.lower()] = model_name
 MIN_BATCH_SIZE = 1
-DEFAULT_MAX_BATCH = 1024  # Increased for stress testing
+DEFAULT_MAX_BATCH = 32  # Limited to prevent MLX buffer cache bloat
 DEFAULT_MAX_LENGTH = 8192
 DEFAULT_PORT = 8000
 DEFAULT_HOST = "0.0.0.0"
+DEFAULT_MAX_CONCURRENT_REQUESTS = 4  # Limit concurrent request processing (reduced due to MLX buffer cache)
 
 # Configure logging
 def setup_logging(level: str = "INFO") -> logging.Logger:
@@ -86,6 +88,7 @@ class ServerConfig:
     port: int = int(os.getenv("PORT", str(DEFAULT_PORT)))
     host: str = os.getenv("HOST", DEFAULT_HOST)
     enable_cors: bool = os.getenv("ENABLE_CORS", "true").lower() == "true"
+    max_concurrent_requests: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", str(DEFAULT_MAX_CONCURRENT_REQUESTS)))
     cors_origins: List[str] = None
     
     def __post_init__(self):
@@ -98,6 +101,8 @@ class ServerConfig:
             raise ValueError("max_text_length must be positive")
         if self.port < 1 or self.port > 65535:
             raise ValueError("port must be between 1 and 65535")
+        if self.max_concurrent_requests < 1:
+            raise ValueError("max_concurrent_requests must be at least 1")
 
 # Load configuration
 config = ServerConfig()
@@ -126,6 +131,7 @@ class ModelManager:
         self._embedding_cache: Dict[str, np.ndarray] = {}
         self._global_lock = asyncio.Lock()  # For managing model dict
         self.max_loaded_models = 2  # Maximum models to keep in memory
+        self._request_semaphore = asyncio.Semaphore(config.max_concurrent_requests)  # Limit concurrent requests
         
     def _resolve_model_name(self, model_identifier: Optional[str] = None) -> str:
         """Resolve model identifier to actual model name"""
@@ -242,23 +248,23 @@ class ModelManager:
     def _get_hidden_states(self, input_ids: mx.array, model: Any) -> mx.array:
         """
         Extract hidden states from the model before output projection.
-        
+
         Args:
             input_ids: Token IDs as MLX array [batch_size, seq_len]
-            
+
         Returns:
             Hidden states [batch_size, seq_len, hidden_dim]
         """
         # Get token embeddings
         h = model.model.embed_tokens(input_ids)
-        
+
         # Pass through transformer layers
         for layer in model.model.layers:
             h = layer(h, mask=None, cache=None)
-        
+
         # Apply final layer normalization
         h = model.model.norm(h)
-        
+
         return h
     
     async def generate_embeddings(
@@ -280,59 +286,80 @@ class ModelManager:
         """
         # Resolve and load model if needed
         model_name = await self.load_model(model_name)
-        
+
         if self.model_status.get(model_name) != ModelStatus.READY:
             raise RuntimeError(f"Model {model_name} not ready (status: {self.model_status.get(model_name)})")
-        
+
         if not texts:
             embedding_dim = AVAILABLE_MODELS[model_name]["embedding_dim"]
             return np.array([]), model_name, embedding_dim
-        
-        model, tokenizer = self.models[model_name]
-        embedding_dim = AVAILABLE_MODELS[model_name]["embedding_dim"]
-        
-        embeddings = []
-        
-        for text in texts:
-            # Check cache if enabled
-            cache_key = f"{model_name}:{text}:{normalize}"
-            if cache_key in self._embedding_cache:
-                embeddings.append(self._embedding_cache[cache_key])
-                continue
-            
-            # Tokenize text
-            tokens = tokenizer.encode(text)
-            
-            # Truncate if necessary
-            if len(tokens) > self.config.max_text_length:
-                logger.warning(f"Truncating text from {len(tokens)} to {self.config.max_text_length} tokens")
-                tokens = tokens[:self.config.max_text_length]
-            
-            # Convert to MLX array with batch dimension
-            input_ids = mx.array([tokens])
-            
-            # Get hidden states
-            hidden_states = self._get_hidden_states(input_ids, model)
-            
-            # Mean pooling across sequence dimension
-            pooled = mx.mean(hidden_states, axis=1)  # [1, hidden_dim]
-            
-            # Normalize if requested
-            if normalize:
-                norm = mx.linalg.norm(pooled, axis=1, keepdims=True)
-                pooled = pooled / mx.maximum(norm, 1e-9)
-            
-            # Force evaluation and convert to numpy
-            mx.eval(pooled)
-            embedding = np.array(pooled.tolist()[0], dtype=np.float32)
-            
-            # Cache the result (with size limit)
-            if len(self._embedding_cache) < 1000:  # Simple cache size limit
-                self._embedding_cache[cache_key] = embedding
-            
-            embeddings.append(embedding)
-        
-        return np.array(embeddings, dtype=np.float32), model_name, embedding_dim
+
+        # Use semaphore to limit concurrent request processing
+        async with self._request_semaphore:
+            model, tokenizer = self.models[model_name]
+            embedding_dim = AVAILABLE_MODELS[model_name]["embedding_dim"]
+
+            embeddings = []
+
+            for idx, text in enumerate(texts):
+                # Cache disabled to prevent memory buildup
+                # cache_key = f"{model_name}:{text}:{normalize}"
+                # if cache_key in self._embedding_cache:
+                #     embeddings.append(self._embedding_cache[cache_key])
+                #     continue
+
+                # Tokenize text
+                tokens = tokenizer.encode(text)
+
+                # Truncate if necessary
+                if len(tokens) > self.config.max_text_length:
+                    logger.warning(f"Truncating text from {len(tokens)} to {self.config.max_text_length} tokens")
+                    tokens = tokens[:self.config.max_text_length]
+
+                # Convert to MLX array with batch dimension
+                input_ids = mx.array([tokens])
+
+                # Get hidden states
+                hidden_states = self._get_hidden_states(input_ids, model)
+
+                # Mean pooling across sequence dimension
+                pooled = mx.mean(hidden_states, axis=1)  # [1, hidden_dim]
+
+                # Normalize if requested
+                if normalize:
+                    norm = mx.linalg.norm(pooled, axis=1, keepdims=True)
+                    pooled = pooled / mx.maximum(norm, 1e-9)
+                    del norm  # Free immediately
+
+                # Force evaluation and convert to numpy
+                mx.eval(pooled)
+                embedding = np.array(pooled.tolist()[0], dtype=np.float32)
+
+                # Explicitly delete MLX arrays to free memory immediately
+                del input_ids
+                del hidden_states
+                del pooled
+
+                # Cache disabled to prevent memory buildup
+                # if len(self._embedding_cache) < 100:  # Simple cache size limit
+                #     self._embedding_cache[cache_key] = embedding
+
+                embeddings.append(embedding)
+
+                # Periodic garbage collection for large batches to prevent accumulation
+                if (idx + 1) % 10 == 0:
+                    gc.collect()
+
+            result = np.array(embeddings, dtype=np.float32), model_name, embedding_dim
+
+            # Force garbage collection to help free MLX arrays and numpy data
+            # This is especially important under high request load
+            gc.collect()
+
+            # Clear MLX cache to release GPU memory
+            mx.clear_cache()
+
+            return result
     
     def get_status(self, model_name: Optional[str] = None) -> Dict[str, Any]:
         """Get current model status and information"""
@@ -411,7 +438,7 @@ class BatchEmbedRequest(BaseModel):
         ...,
         description="List of texts to embed",
         min_length=1,
-        max_length=1024  # Allow larger batches for stress testing
+        max_length=config.max_batch_size  # Limited to prevent MLX buffer cache bloat
     )
     model: Optional[str] = Field(
         default=None,
@@ -457,14 +484,20 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting Qwen3 Embedding Server v{app.version}")
     logger.info(f"Configuration: {config}")
     logger.info(f"Available models: {list(AVAILABLE_MODELS.keys())}")
-    
+
+    # Set MLX cache limit to prevent unbounded GPU memory growth
+    # 16GB limit - larger cache for better performance while still preventing runaway growth
+    cache_limit_bytes = 16 * 1024 * 1024 * 1024  # 16 GB
+    mx.set_cache_limit(cache_limit_bytes)
+    logger.info(f"MLX cache limit set to {cache_limit_bytes / 1024 / 1024 / 1024:.1f} GB")
+
     try:
         # Load default model at startup
         await model_manager.load_model(config.model_name)
     except Exception as e:
         logger.error(f"Failed to initialize server with default model: {e}")
         # Server can still start, models will be loaded on demand
-    
+
     app.state.start_time = time.time()
     
     yield
@@ -685,6 +718,7 @@ async def get_metrics():
             "port": config.port,
             "max_batch_size": config.max_batch_size,
             "max_text_length": config.max_text_length,
+            "max_concurrent_requests": config.max_concurrent_requests,
             "cors_enabled": config.enable_cors
         },
         "version": app.version
