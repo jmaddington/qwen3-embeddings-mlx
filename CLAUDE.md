@@ -151,3 +151,51 @@ curl -X POST http://localhost:8000/embed \
   -H "Content-Type: application/json" \
   -d '{"text":"Hello world", "model":"mlx-community/Qwen3-Embedding-4B-4bit-DWQ"}'
 ```
+
+### OpenAI-Compatible API
+
+The server now provides an OpenAI-compatible `/v1/embeddings` endpoint:
+
+```bash
+# Single text embedding (OpenAI format)
+curl -X POST http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input":"Hello world", "model":"small"}'
+
+# Batch embeddings (OpenAI format)
+curl -X POST http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input":["Text 1", "Text 2", "Text 3"], "model":"medium"}'
+
+# Base64 encoding format (reduces bandwidth)
+curl -X POST http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input":"Test", "model":"small", "encoding_format":"base64"}'
+```
+
+**Implementation details:**
+- Always returns normalized embeddings (matching OpenAI behavior)
+- Supports both `float` and `base64` encoding formats
+- Includes token usage statistics in response
+- `dimensions` parameter is accepted but ignored (always returns full embeddings)
+- Use native model names (`small`, `medium`, `large`) instead of OpenAI model names
+- Compatible with OpenAI Python SDK when using `base_url="http://localhost:8000/v1"`
+
+**Response format:**
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "embedding": [0.123, -0.456, ...],
+      "index": 0
+    }
+  ],
+  "model": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
+  "usage": {
+    "prompt_tokens": 7,
+    "total_tokens": 7
+  }
+}
+```

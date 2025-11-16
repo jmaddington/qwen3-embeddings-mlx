@@ -12,7 +12,9 @@ import time
 import asyncio
 import logging
 import gc
-from typing import List, Optional, Dict, Any, Tuple
+import base64
+import struct
+from typing import List, Optional, Dict, Any, Tuple, Union
 from functools import lru_cache
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -34,17 +36,17 @@ DEFAULT_MODEL = "mlx-community/Qwen3-Embedding-8B-4bit-DWQ"
 # Available models configuration
 AVAILABLE_MODELS = {
     "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ": {
-        "alias": ["small", "0.6b", "default"],
+        "alias": ["small", "0.6b", "default", "qwen3-embedding-0.6b"],
         "embedding_dim": 1024,
         "description": "Small 0.6B parameter model, fast and efficient"
     },
     "mlx-community/Qwen3-Embedding-4B-4bit-DWQ": {
-        "alias": ["medium", "4b"],
+        "alias": ["medium", "4b", "qwen3-embedding-4b"],
         "embedding_dim": 2560,
         "description": "Medium 4B parameter model, balanced performance"
     },
     "mlx-community/Qwen3-Embedding-8B-4bit-DWQ": {
-        "alias": ["large", "8b"],
+        "alias": ["large", "8b", "qwen3-embedding-8b"],
         "embedding_dim": 4096,
         "description": "Large 8B parameter model, higher quality embeddings"
     }
@@ -77,6 +79,22 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
 
 # Initialize logger
 logger = setup_logging(os.getenv("LOG_LEVEL", "INFO"))
+
+# Utility functions
+def encode_embedding_base64(embedding: List[float]) -> str:
+    """
+    Encode a float embedding array as a base64 string.
+
+    Args:
+        embedding: List of floats representing the embedding
+
+    Returns:
+        Base64-encoded string
+    """
+    # Pack floats as little-endian IEEE 754 floats
+    float_bytes = struct.pack(f'<{len(embedding)}f', *embedding)
+    # Encode to base64
+    return base64.b64encode(float_bytes).decode('utf-8')
 
 # Configuration
 @dataclass
@@ -476,6 +494,71 @@ class HealthResponse(BaseModel):
     memory_usage_mb: Optional[float] = Field(None, description="Memory usage in MB")
     uptime_seconds: float = Field(..., description="Service uptime in seconds")
 
+# OpenAI-compatible API models
+class OpenAIEmbeddingRequest(BaseModel):
+    """OpenAI-compatible embedding request"""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    input: Union[str, List[str]] = Field(
+        ...,
+        description="Input text or array of texts to embed"
+    )
+    model: str = Field(
+        ...,
+        description="Model to use (use native aliases: 'small', 'medium', 'large' or full model names)"
+    )
+    encoding_format: Optional[str] = Field(
+        default="float",
+        description="Encoding format for embeddings: 'float' or 'base64'"
+    )
+    dimensions: Optional[int] = Field(
+        default=None,
+        description="Number of dimensions (ignored, always returns full embeddings)"
+    )
+    user: Optional[str] = Field(
+        default=None,
+        description="Optional user identifier for tracking"
+    )
+
+    @field_validator('input')
+    def validate_input(cls, v):
+        if isinstance(v, str):
+            if not v or v.isspace():
+                raise ValueError("Input text cannot be empty or whitespace only")
+        elif isinstance(v, list):
+            if not v:
+                raise ValueError("Input list cannot be empty")
+            for i, text in enumerate(v):
+                if not text or text.isspace():
+                    raise ValueError(f"Text at index {i} cannot be empty or whitespace only")
+        else:
+            raise ValueError("Input must be a string or list of strings")
+        return v
+
+    @field_validator('encoding_format')
+    def validate_encoding_format(cls, v):
+        if v and v not in ["float", "base64"]:
+            raise ValueError("encoding_format must be 'float' or 'base64'")
+        return v
+
+class UsageInfo(BaseModel):
+    """Token usage information"""
+    prompt_tokens: int = Field(..., description="Number of tokens in the prompt")
+    total_tokens: int = Field(..., description="Total number of tokens")
+
+class EmbeddingObject(BaseModel):
+    """Individual embedding object"""
+    object: str = Field(default="embedding", description="Object type")
+    embedding: Union[List[float], str] = Field(..., description="Embedding vector or base64-encoded string")
+    index: int = Field(..., description="Index in the input array")
+
+class OpenAIEmbeddingResponse(BaseModel):
+    """OpenAI-compatible embedding response"""
+    object: str = Field(default="list", description="Object type")
+    data: List[EmbeddingObject] = Field(..., description="List of embeddings")
+    model: str = Field(..., description="Model used")
+    usage: UsageInfo = Field(..., description="Token usage information")
+
 # Application lifespan management
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -568,6 +651,7 @@ async def root():
         "endpoints": {
             "embeddings": "/embed",
             "batch_embeddings": "/embed_batch",
+            "openai_embeddings": "/v1/embeddings",
             "health": "/health",
             "metrics": "/metrics",
             "models": "/models",
@@ -654,6 +738,92 @@ async def embed_batch(request: BatchEmbedRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Batch embedding generation failed: {str(e)}"
+        )
+
+@app.post(
+    "/v1/embeddings",
+    response_model=OpenAIEmbeddingResponse,
+    tags=["OpenAI Compatible"],
+    status_code=status.HTTP_200_OK
+)
+async def create_embeddings(request: OpenAIEmbeddingRequest):
+    """
+    OpenAI-compatible embeddings endpoint.
+
+    This endpoint follows the OpenAI API specification for embeddings,
+    allowing drop-in compatibility with OpenAI client libraries.
+
+    Note: Use native model names ('small', 'medium', 'large') or full
+    model names. The 'dimensions' parameter is ignored - full embeddings
+    are always returned.
+    """
+    try:
+        # Normalize input to list of strings
+        texts = [request.input] if isinstance(request.input, str) else request.input
+
+        # Validate batch size
+        if len(texts) > config.max_batch_size:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Batch size {len(texts)} exceeds maximum of {config.max_batch_size}"
+            )
+
+        # Generate embeddings (always normalized for OpenAI compatibility)
+        embeddings, model_used, embedding_dim = await model_manager.generate_embeddings(
+            texts,
+            model_name=request.model,
+            normalize=True  # OpenAI always returns normalized embeddings
+        )
+
+        # Count tokens for usage tracking
+        # Get tokenizer from the loaded model
+        _, tokenizer = model_manager.models[model_used]
+        total_tokens = 0
+        for text in texts:
+            tokens = tokenizer.encode(text)
+            # Truncate count if text was truncated
+            token_count = min(len(tokens), config.max_text_length)
+            total_tokens += token_count
+
+        # Format embeddings based on encoding format
+        embedding_data = []
+        for idx, embedding in enumerate(embeddings):
+            embedding_list = embedding.tolist()
+
+            if request.encoding_format == "base64":
+                # Encode as base64
+                encoded_embedding = encode_embedding_base64(embedding_list)
+            else:
+                # Return as float array
+                encoded_embedding = embedding_list
+
+            embedding_data.append(
+                EmbeddingObject(
+                    object="embedding",
+                    embedding=encoded_embedding,
+                    index=idx
+                )
+            )
+
+        # Create response
+        return OpenAIEmbeddingResponse(
+            object="list",
+            data=embedding_data,
+            model=model_used,
+            usage=UsageInfo(
+                prompt_tokens=total_tokens,
+                total_tokens=total_tokens
+            )
+        )
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"OpenAI embeddings generation failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Embedding generation failed: {str(e)}"
         )
 
 @app.get(

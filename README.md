@@ -108,6 +108,65 @@ POST /embed_batch
 }
 ```
 
+#### OpenAI-Compatible Embeddings (NEW)
+
+Drop-in replacement for OpenAI's embeddings API:
+
+```bash
+POST /v1/embeddings
+{
+  "input": "Your text here",                    # or ["Text 1", "Text 2"]
+  "model": "small|medium|large",                 # required (use native names)
+  "encoding_format": "float"                     # optional: "float" (default) or "base64"
+}
+```
+
+**Response format** (OpenAI-compatible):
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "embedding": [0.123, -0.456, ...],       # or base64 string
+      "index": 0
+    }
+  ],
+  "model": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
+  "usage": {
+    "prompt_tokens": 7,
+    "total_tokens": 7
+  }
+}
+```
+
+**Supported model names**:
+- `qwen3-embedding-0.6b` (1024 dims) - or use: `small`, `0.6b`
+- `qwen3-embedding-4b` (2560 dims) - or use: `medium`, `4b`
+- `qwen3-embedding-8b` (4096 dims) - or use: `large`, `8b`
+
+**Note**: The `dimensions` parameter is ignored - full embeddings are always returned.
+
+**Example with OpenAI Python SDK**:
+```python
+from openai import OpenAI
+
+# Point to local server
+client = OpenAI(
+    api_key="not-needed",
+    base_url="http://localhost:8000/v1"
+)
+
+# Use exactly like OpenAI
+response = client.embeddings.create(
+    input="Machine learning is transforming the world",
+    model="qwen3-embedding-4b"  # or: small, medium, large, etc.
+)
+
+embedding = response.data[0].embedding
+print(f"Dimensions: {len(embedding)}")  # 2560 for 4B model
+```
+
 #### List Available Models
 
 ```bash
